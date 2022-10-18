@@ -1,0 +1,371 @@
+#!/usr/bin/env bash
+# ##########################################################
+scriptname="bnet"
+synopsis="Enumerate network"
+script_path="$(dirname \"$0\")"
+#===================================================================================
+# Configuration
+splitsize=15
+tmptar=/tmp/bnet_$RANDOM
+
+#===================================================================================
+
+_usage() {
+  echo "                    .:odxxddl:,.                        "
+  echo "                  'lxOkol::;;,,,'.                      " 
+  echo "               ,xXWKOkOKXXXX0xl;.                       "
+  echo "             .dNMMMMMWXOdooooddxdc;.                    "
+  echo "            ,OWMMWXkl;.           ..                    "
+  echo "           cXMWKd:.                                     "
+  echo "         .oNMWk'                         ..             "
+  echo "        .dNMWx.                          'd:            "
+  echo "       .xWMWx.                           .xK;           "
+  echo "      .dWMWk.                             dW0,          "
+  echo "      :XMMK;   .                     .    dWMO          "
+  echo "      :XMM0'  .oo'....';:;,'.......'c;   .xMWk          "
+  echo "      .oNMX;  .dNNK0KXNWMk:'...'',,...   ,KMO'          "
+  echo "       .oNWd.  'OWMMMMMMMx,.            .dWO'           "
+  echo "         cKK;   ,0MMMMMMMx,.            cKk'            "
+  echo "          ,Ox'   ;0MMMMMMx,.          .:Od.   bnet      "
+  echo "           .okd,  ;KMMMMMx'.        .oOkc     by breachr"
+  echo "             :O0:  ,xKWMWd..       .xKx'                "
+  echo "              .ckl.  .,:c'        ,xx,                  "
+  echo "                .::.            .;c,                    "
+  echo ""
+  echo ""
+  echo "Usage: bnet <MODULE> <TARGET>"
+  echo "Target: IP, CIDR, Interface, file or space separated list of IPs/CIDRs"
+  echo "Modules:"
+  echo ""
+  echo "q     Quick scan with extended info"
+  echo "i     Quick scan IP output only (saved to ip_alive.txt)"
+  echo "c     Convert Targets (e.g. CIDR) to simple IP list"
+  echo "d     run a Deep alive scan for reports"
+  echo "s     split up ip list in groups of $splitsize"
+  echo "n     Find hostnames for targets"
+  echo "all   identify all service types on network"
+  echo "http  identify http services on network"
+  echo "ftp   identify ftp services on network"
+  echo "smb   identify smb services on network"
+  echo "dc    identify dcs on network"
+}
+
+_parse_target() {
+  args="$@"
+  targets=$(echo $args | cut -d" " -f2-)
+  # targets=("${args[@]:1}")  # Remove module (first arg)
+  return_targets=""
+  for target in $targets; do
+    if [[ -f $target ]]; then
+      return_targets="$return_targets $(nmap -sL -n -iL $target | awk '/Nmap scan report/{print $NF}')"
+    elif [[ ${#target} -lt 6 ]]; then # target is interface
+      return_targets="$return_targets $(nmap -sL -n $(ip -f inet addr show $target | grep inet | cut -d ' ' -f6) | awk '/Nmap scan report/{print $NF}')"
+      return_targets=$(echo $return_targets | grep -v $target)
+    else
+      return_targets="$return_targets $(nmap -sL -n $target | awk '/Nmap scan report/{print $NF}')"
+    fi
+  done
+  echo $return_targets | tr " " "\n" > $tmptar
+}
+
+_quickscan() {
+  nmap -sn -iL $tmptar --min-rate 5000 | egrep -v "(Unknown|latency|Starting Nmap)" | sed -E 's/^Nmap scan report for |^Host is up.|Nmap done: //' | sed ':a;N;$!ba;s/\nMAC Address: / /g' | sed -E "s/[0-9a-fA-F:]{17}//" |sed -E 's/addresses//'|sed -E 's/hosts//' #|column -t
+}
+
+_quickscan_ip_only() {
+  nmap -sn -n -iL $tmptar --min-rate 5000 | egrep -v "(Unknown|latency|Starting Nmap)" | sed -E 's/^Nmap scan report for |^Host is up.|Nmap done: //' | sed ':a;N;$!ba;s/\nMAC Address: / /g' | sed -E "s/[0-9a-fA-F:]{17}//" |sed -E 's/addresses//'|sed -E 's/hosts//'| head -n -1 | sed '/^[[:space:]]*$/d' | cut -d" " -f1 | tee -a ip_alive.txt
+  cat ip_alive.txt | sort -u -t . -k 3,3n -k 4,4n > /tmp/ip_alive.txt && mv /tmp/ip_alive.txt ip_alive.txt
+  sed -i '/^$/d' ip_alive.txt
+  echo "Updated ip_alive.txt. Current IP count: $(wc ip_alive.txt | cut -d" " -f2)"
+}
+
+_convert() {
+  nmap -sL -n -iL $tmptar | awk '/Nmap scan report/{print $NF}'
+}
+
+_split() {
+  countfile=1
+  lincount=1
+  while read lin; do
+    if (( $countfile < 10 ));then
+      echo $lin >> ip_split_0$countfile.txt
+    else
+      echo $lin >> ip_split_$countfile.txt
+    fi
+    ((lincount++))
+    if (( $lincount == 11 )); then
+      ((countfile++))
+      lincount=1
+    fi
+  done <ip_alive.txt
+  sed -i '/^$/d' ip_split*
+  echo "Done splitting. Created $countfile files."
+}
+
+_namescan() {
+  while read lin; do
+      hname=$(dig +short -x $lin | tr '\n' "\t")
+      if [ "$hname" != "" ]; then
+          echo -e "$lin\t$hname" 
+          echo -e "$lin\t$hname" >> ip_hnames.txt
+      else
+          echo -n -e "$lin\tNot Found\\r"
+      fi
+      sleep 0.01
+  done <$tmptar
+  cat ip_hnames.txt | sort -u -t . -k 3,3n -k 4,4n > /tmp/ip_hnames.txt && mv /tmp/ip_hnames.txt ip_hnames.txt
+}
+
+_deepscan() {
+  printf "\n\n$(date)\thost alive checks for:<br>\n" > ip_report.txt
+  echo "$@<br>" >> ip_report.txt
+  printf "\n%-15s | %-6s | %-6s | %-6s | %-6s | %-6s | %-6s | %-6s | %-6s |" "IP" "PING" "TIME" "SYN" "ACK" "UDP" "AMQ" "SCTP" "IPP" >> ip_report.txt
+  printf "\n%-15s | %-6s | %-6s | %-6s | %-6s | %-6s | %-6s | %-6s | %-6s |" "---" "---" "---" "---" "---" "---" "---" "---" "---" >> ip_report.txt
+  
+  while read ip; do
+    echo "checking $ip..."
+    PING="$(nmap -PE -n -sn $ip | grep 'Host is up' | grep -o up)"
+    TIME="$(nmap -PP -n -sn $ip | grep 'Host is up' | grep -o up)"
+    SYN="$(nmap -PS1,3,7,9,13,17,19,21-23,25-26,37,53,79-82,88,100,106,110-111,113,119,135,139,143-144,179,199,254-255,280,311,389,427,443-445,464-465,497,513-515,543-544,548,554,587,593,625,631,636,646,787,808,873,902,990,993,995,1000,1022,1024-1033,1035-1041,1044,1048-1050,1053-1054,1056,1058-1059,1064-1066,1069,1071,1074,1080,1110,1234,1433,1494,1521,1720,1723,1755,1761,1801,1900,1935,1998,2000-2003,2005,2049,2103,2105,2107,2121,2161,2301,2383,2401,2601,2717,2869,2967,3000-3001,3128,3268,3306,3389,3689-3690,3703,3986,4000-4001,4045,4899,5000-5001,5003,5009,5050-5051,5060,5101,5120,5190,5357,5432,5555,5631,5666,5800,5900-5901,6000-6002,6004,6112,6646,6666,7000,7070,7937-7938,8000,8002,8008-8010,8031,8080-8081,8443,8888,9000-9001,9090,9100,9102,9999-10001,10010,32768,32771,49152-49157,50000 -sn $ip | grep 'Host is up' | grep -o up)"
+    ACK="$(nmap -PA21,22,23,25,53,79,80,88,110,111,113,137,145,443,445,8080,10042 -sn $ip | grep 'Host is up' | grep -o up)"
+    UDP="$(nmap -PU53,67,123,135,137,138,161,445,500,631,1434,40125,50123,5060,3400 -sn $ip | grep 'Host is up' | grep -o up)"
+    AMQ="$(nmap -PM -sn $ip | grep 'Host is up' | grep -o up)"
+    SCTP="$(nmap -PY -sn $ip | grep 'Host is up' | grep -o up)"
+    IPP="$(nmap -PO -sn $ip | grep 'Host is up' | grep -o up)"
+    # TODO for local networks:
+    # sudo nmap -sn -PR $IP
+    if [[ ! -z $PING || ! -z $TIME || ! -z $SYN || ! -z $ACK || ! -z $UDP || ! -z $AMQ || ! -z $SCTP || ! -z $IPP ]]; then
+      echo "$ip" >> ip_alive.txt
+      echo "...its alive"
+    fi
+    printf "\n%-15s | %-6s | %-6s | %-6s | %-6s | %-6s | %-6s | %-6s | %-6s |" "$ip" "$PING" "$TIME" "$SYN" "$ACK" "$UDP" "$AMQ" "$SCTP" "$IPP" >> ip_report.txt
+  done <$tmptar
+  cat ip_alive.txt | sort -u -t . -k 3,3n -k 4,4n > /tmp/ip_alive.txt && mv /tmp/ip_alive.txt ip_alive.txt
+  # Remove empty lines
+  sed -i '/^$/d' ip_alive.txt
+  echo "Updated ip_alive.txt. Current IP count: $(wc ip_alive.txt | cut -d" " -f2)"
+}
+
+_svc_scan() {
+  case $1 in
+    "http"|"svc")
+      _svc_http
+      ;;&
+    "smb"|"svc")
+      _svc_smb
+      ;;&
+    "ftp"|"svc")
+      printf "\nFinding ftp services (Output: ip_ftp.txt)\n"
+      nmap -n -Pn -vv -p 21,990 -iL $tmptar | grep Discovered | cut -d" " -f6 | tee -a ip_ftp.txt
+      cat ip_ftp.txt | sort -u > /tmp/ip_ftp.txt && mv /tmp/ip_ftp.txt ip_ftp.txt
+      ;;&
+    "ssh"|"svc")
+      printf "\nFinding ssh services (Output: ip_ssh.txt)\n"
+      nmap -n -Pn -vv -p 22 -iL $tmptar | grep Discovered | cut -d" " -f6 | tee -a ip_ssh.txt
+      cat ip_ssh.txt | sort -u > /tmp/ip_ssh.txt && mv /tmp/ip_ssh.txt ip_ssh.txt
+      ;;&
+    "ldap"|"svc")
+      printf "\nFinding ldap services (Output: ip_ldap.txt)\n"
+      nmap -n -Pn -vv -p 389,636,3268,3269 -iL $tmptar | grep Discovered | cut -d" " -f6 | tee -a ip_ldap.txt
+      cat ip_ldap.txt | sort -u > /tmp/ip_ldap.txt && mv /tmp/ip_ldap.txt ip_ldap.txt
+      ;;&
+    "telnet"|"svc")
+      printf "\nFinding telnet services (Output: ip_telnet.txt)\n"
+      nmap -n -Pn -vv -p 23 -iL $tmptar | grep Discovered | cut -d" " -f6 | tee -a ip_telnet.txt
+      cat ip_telnet.txt | sort -u > /tmp/ip_telnet.txt && mv /tmp/ip_telnet.txt ip_telnet.txt
+      ;;&
+    "nameserver"|"svc")
+      printf "\nFinding nameserver services (Output: ip_nameserver.txt)\n"
+      nmap -n -Pn -vv -p 53 -iL $tmptar | grep Discovered | cut -d" " -f6 | tee -a ip_nameserver.txt
+      nmap -n -sU -Pn -vv -p 53 -iL $tmptar | grep Discovered | cut -d" " -f6 | tee -a ip_nameserver.txt
+      cat ip_nameserver.txt | sort -u > /tmp/ip_nameserver.txt && mv /tmp/ip_nameserver.txt ip_nameserver.txt
+      ;;&
+    "rdp"|"svc")
+      printf "\nFinding rdp services (Output: ip_rdp.txt)\n"
+      nmap -n -Pn -vv -p 3389 -iL $tmptar | grep Discovered | cut -d" " -f6 | tee -a ip_rdp.txt
+      cat ip_rdp.txt | sort -u > /tmp/ip_rdp.txt && mv /tmp/ip_rdp.txt ip_rdp.txt
+      ;;&
+    "dc"|"svc")
+      printf "\nFinding dc services (Output: ip_dc.txt)\n"
+      nmap -n -Pn -vv -p 88,389 -iL $tmptar | grep Discovered | cut -d" " -f6 | tee -a ip_dc.txt
+      cat ip_dc.txt | sort -u > /tmp/ip_dc.txt && mv /tmp/ip_dc.txt ip_dc.txt
+      ;;&
+    "winrm"|"svc")
+      printf "\nFinding winrm services (Output: ip_winrm.txt)\n"
+      nmap -n -Pn -vv -p 5985,5986 -iL $tmptar | grep Discovered | cut -d" " -f6 | tee -a ip_winrm.txt
+      cat ip_winrm.txt | sort -u > /tmp/ip_winrm.txt && mv /tmp/ip_winrm.txt ip_winrm.txt
+      ;;&
+    "mssql"|"svc")
+      printf "\nFinding mssql services (Output: ip_mssql.txt)\n"
+      nmap -n -Pn -vv -p 1433 -iL $tmptar | grep Discovered | cut -d" " -f6 | tee -a ip_mssql.txt
+      cat ip_mssql.txt | sort -u > /tmp/ip_mssql.txt && mv /tmp/ip_mssql.txt ip_mssql.txt
+      ;;&
+    "mysql"|"svc")
+      printf "\nFinding mysql services (Output: ip_mysql.txt)\n"
+      nmap -n -Pn -vv -p 3306 -iL $tmptar | grep Discovered | cut -d" " -f6 | tee -a ip_mysql.txt
+      cat ip_mysql.txt | sort -u > /tmp/ip_mysql.txt && mv /tmp/ip_mysql.txt ip_mysql.txt
+      ;;&
+    "nfs"|"svc")
+      printf "\nFinding nfs services (Output: ip_nfs.txt)\n"
+      nmap -n -Pn -vv -p 111,2049 -iL $tmptar | grep Discovered | cut -d" " -f6 | tee -a ip_nfs.txt
+      cat ip_nfs.txt | sort -u > /tmp/ip_nfs.txt && mv /tmp/ip_nfs.txt ip_nfs.txt
+      ;;&
+    "printer"|"svc")
+      _svc_printer
+      ;;&
+    "oracledb"|"svc")
+      printf "\nFinding oracledb services (Output: ip_oracledb.txt)\n"
+      nmap -n -Pn -vv -p 1521 -iL $tmptar | grep Discovered | cut -d" " -f6 | tee -a ip_oracledb.txt
+      cat ip_oracledb.txt | sort -u > /tmp/ip_oracledb.txt && mv /tmp/ip_oracledb.txt ip_oracledb.txt
+      ;;&
+    "vnc"|"svc")
+      printf "\nFinding vnc services (Output: ip_vnc.txt)\n"
+      nmap -n -Pn -vv -p 5900 -iL $tmptar | grep Discovered | cut -d" " -f6 | tee -a ip_vnc.txt
+      cat ip_vnc.txt | sort -u > /tmp/ip_vnc.txt && mv /tmp/ip_vnc.txt ip_vnc.txt
+      ;;&
+    "postgre"|"svc")
+      printf "\nFinding postgre services (Output: ip_postgre.txt)\n"
+      nmap -n -Pn -vv -p 5453 -iL $tmptar | grep Discovered | cut -d" " -f6 | tee -a ip_postgre.txt
+      cat ip_postgre.txt | sort -u > /tmp/ip_postgre.txt && mv /tmp/ip_postgre.txt ip_postgre.txt
+      ;;
+  esac
+}
+
+_svc_http() {
+  # ! Services
+  printf "\nFinding http services (ip_http.txt)\n"
+  nmap -n -Pn -vv -p 80,8000,8008,8080,8888,8090,4443,4444,443,8443,591 -iL $tmptar | grep Discovered >> /tmp/http1
+  cat /tmp/http1 | sort -u > /tmp/http2
+  awk ' { t = $4; $4 = $6; $6 = t; print; } ' /tmp/http2 | cut -d' ' -f4,6 | cut -d'/' -f1 | sed -r 's/ /:/g' > /tmp/http3
+  while read lin; do
+    port=(${lin//:/ })
+    port=${port[1]}
+    if grep -q "44" <<< "$port"; then
+      echo "https://$lin" >> ip_http.txt
+    else
+      echo "http://$lin" >> ip_http.txt
+    fi
+  done </tmp/http3
+  cat ip_http.txt | sort -u > /tmp/ip_http.txt && mv /tmp/ip_http.txt ip_http.txt
+
+  # ! Titles
+  printf "\nLooking up HTTP titles (ip_http_tit.txt)\n"
+  while read lin; do
+    if ! $(curl -L -f -k -m 4 $lin > /dev/null 2>&1);then
+      printf "%-30s %s\n" $lin "Not Found / Forbidden / Error" | tee -a ip_http_tits.txt
+    else
+      tit=$(curl -L -f -k -m 4 $lin 2>/dev/null | tr -d '\n' | grep -o '<title>.*</title>' | tr -d '\n' | perl -MHTML::Entities -pe 'decode_entities($_);' | sed 's/\(<title>\|<\/title>\)//g') # | xargs -I{} printf "%-30s %s\n" $lin {})
+      if [ "$tit" == "" ]; then
+        printf "%-30s %s\n" $lin "Empty Title / Special Redirect" | tee -a ip_http_tits.txt
+      else
+        printf "%-30s %s\n" $lin "$tit" | tee -a ip_http_tits.txt
+      fi
+    fi
+  done <ip_http.txt
+  cat ip_http_tits.txt | sort -u | sort -k 2 > /tmp/httptits && mv /tmp/httptits ip_http_tits.txt
+  cat ip_http_tits.txt | grep -a 'http:' > ip_http_nossl.txt
+
+  # ! SSL
+  printf "\nChecking SSL (ip_http_weakcipher.txt)\n"
+  cat ip_http.txt | grep https > ip_http_ssl.txt
+  while read lin; do
+      resu=$(sslscan --no-ciphersuites --no-heartbleed $lin | grep -e 'TLSv1.[01].*enabled')
+      if ! [ -z "$resu" ]; then
+          echo "$lin is weak:"
+          echo $resu
+          echo "$lin" >> ip_http_weakcipher.txt
+      fi
+  done <ip_http_ssl.txt
+  cat ip_http_weakcipher.txt | sort -u | sort -k 2 > /tmp/weakcipher && mv /tmp/weakcipher ip_http_weakcipher.txt
+
+  # ! Sec-Header
+  printf "\nChecking Security Header (ip_http_secheader.txt)\n"
+  cat ip_http_tits.txt | grep -av "to nginx" | grep -av "Not Found" | grep -av "IIS Windows" | grep -av "Apache" | cut -d" " -f1 > ip_http_active.txt
+  while read lin; do
+      resu=$(shcheck.py -d $lin | grep 'Frame\|Content-Type\|Content-Security\|Strict-Transport' | grep Missing)
+      if ! [ -z "$resu" ]; then
+          echo "$lin is missing headers:"
+          echo $resu
+          echo "$lin" >> ip_http_secheader.txt
+      fi
+  done <ip_http_active.txt
+  cat ip_http_secheader.txt | sort -u | sort -k 2 > /tmp/secheader && mv /tmp/secheader ip_http_secheader.txt
+}
+
+_svc_smb() {
+  printf "\nFinding smb services (Output: ip_smb.txt)\n"
+  nmap -n -Pn -vv -p 445,139 -iL $tmptar | grep Discovered | cut -d" " -f6 | tee -a ip_smb.txt
+  cat ip_smb.txt | sort -u > /tmp/ip_smb.txt && mv /tmp/ip_smb.txt ip_smb.txt
+
+  # TODO: CME
+  # crackmapexec -t 10 --jitter 1 smb ip_smb.txt --shares | tee all_smb_shares.txt
+  # # <!-- Enum WRITABLE -->
+  # cat all_smb_shares.txt | grep -a WRITE > all_smb_writable.txt
+  # # <!-- Enum READABLE -->
+  # cat all_smb_shares.txt | grep -a READ | grep -v 'IPC\$\|print\$\|READ,WRITE' > all_smb_readable.txt
+}
+
+_svc_printer() {
+  printf "\nFinding printer services (Output: ip_printer.txt)\n"
+  nmap -n -Pn -vv -p 515,631,9100 -iL $tmptar | grep Discovered | cut -d" " -f6 | tee -a ip_printer.txt
+  cat ip_printer.txt | sort -u > /tmp/ip_printer.txt && mv /tmp/ip_printer.txt ip_printer.txt
+
+  # # TODO: Setup PRET
+  # echo "id\nquit" > cme.pre
+  # while read lin; do
+  #     resu=$(timeout 15 python2 ./pret.py $lin ps -i cmd.pre | grep id)
+  #     if ! [ -z "$resu" ]; then
+  #         echo "$lin is weak!"
+  #         echo "$lin" >> all_print_weak.txt
+  #     fi
+  # done <ip_printer.txt
+}
+
+_burp() {
+  while read lin; do
+    curl -f -k -x http://127.0.0.1:8080 $lin
+  done <ip_http.txt
+}
+
+#===================================================================================
+
+if [ $USER != "root" ]; then
+  echo "This must be run as root."
+  exit 1
+elif [ $1 == "s" ]; then
+  _split
+elif [ $# -lt 2 ]; then
+  _usage
+elif [ $1 == "burp" ]; then
+  _burp
+else
+  _parse_target "$@"
+  printf "Targets: $(cat $tmptar | wc -w) \n\n"
+  if [ $1 == "q" ]; then
+    _quickscan
+  elif [ $1 == "i" ]; then
+    _quickscan_ip_only
+  elif [ $1 == "c" ]; then
+    _convert
+  elif [ $1 == "d" ]; then
+    _deepscan
+  elif [ $1 == "n" ]; then
+    _namescan
+  # ! Service Scans
+  elif [ $1 == "svc" ]; then
+    _svc_scan "svc" 
+  elif [ $1 == "http" ]; then
+    _svc_scan $1 
+  elif [ $1 == "smb" ]; then
+    _svc_scan $1 
+  elif [ $1 == "ftp" ]; then
+    _svc_scan $1 
+  else
+    echo "Unknown Module"
+  fi
+  rm $tmptar
+  find . -name "ip_*" -size 0 -delete 
+fi
+
+
+
